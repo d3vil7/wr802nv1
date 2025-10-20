@@ -1,0 +1,167 @@
+name: build-wr802n-bridge
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build-wr802n-bridge.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      OWRT_VER: "18.06.9"
+      TARGET: "ar71xx"
+      SUBTARGET: "tiny"
+      PROFILE: "tl-wr802n-v1"
+      # 下面两个只是内置管理 AP 的名字与密码（给你首登 SSH 用）
+      MGMT_AP_SSID: "Relay-AP"
+      MGMT_AP_KEY: "Relay-AP-Password"
+      # 首启占位的上游（进路由后用 upstream-set 改）
+      UPSTREAM_SSID: "CHANGE_ME_UPSTREAM"
+      UPSTREAM_KEY: "CHANGE_ME_PASS"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential wget xz-utils file rsync
+
+      - name: Download ImageBuilder
+        run: |
+          IB_TAR="openwrt-imagebuilder-${OWRT_VER}-${TARGET}-${SUBTARGET}.Linux-x86_64.tar.xz"
+          IB_URL="https://downloads.openwrt.org/releases/${OWRT_VER}/targets/${TARGET}/${SUBTARGET}/${IB_TAR}"
+          wget -q "${IB_URL}"
+          tar xf "${IB_TAR}"
+          echo "IB_DIR=$(basename "${IB_TAR}" .tar.xz)" >> $GITHUB_ENV
+
+      - name: Create FILES tree (minimal bridge config)
+        run: |
+          set -eux
+          mkdir -p files/etc/config
+          mkdir -p files/etc/uci-defaults
+          mkdir -p files/usr/bin
+
+          # /etc/config/wireless
+          cat > files/etc/config/wireless <<'SH'
+          config wifi-device 'radio0'
+                  option type 'mac80211'
+                  option hwmode '11g'
+                  option path 'platform/ar933x_wmac'
+                  option channel 'auto'
+
+          # STA: connect to upstream (placeholder, change later via SSH)
+          config wifi-iface 'sta'
+                  option device 'radio0'
+                  option mode 'sta'
+                  option network 'wwan'
+                  option ssid '__UP_SSID__'
+                  option encryption 'psk2'
+                  option key '__UP_KEY__'
+
+          # AP: management / downstream
+          config wifi-iface 'ap'
+                  option device 'radio0'
+                  option mode 'ap'
+                  option network 'lan'
+                  option ssid '__AP_SSID__'
+                  option encryption 'psk2'
+                  option key '__AP_KEY__'
+          SH
+          sed -i "s/__UP_SSID__/${UPSTREAM_SSID}/" files/etc/config/wireless
+          sed -i "s/__UP_KEY__/${UPSTREAM_KEY}/" files/etc/config/wireless
+          sed -i "s/__AP_SSID__/${MGMT_AP_SSID}/" files/etc/config/wireless
+          sed -i "s/__AP_KEY__/${MGMT_AP_KEY}/" files/etc/config/wireless
+
+          # /etc/config/network (pure relay bridge)
+          cat > files/etc/config/network <<'SH'
+          config interface 'lan'
+                  option type 'bridge'
+                  option ifname 'eth0'
+                  option proto 'static'
+                  option ipaddr '192.168.2.1'
+                  option netmask '255.255.255.0'
+
+          config interface 'wwan'
+                  option proto 'dhcp'
+
+          config interface 'stabridge'
+                  option proto 'relay'
+                  option network 'lan wwan'
+                  option ipaddr '192.168.1.50'
+          SH
+
+          # uci-defaults: enable SSH; disable DHCP/firewall; reload wifi
+          cat > files/etc/uci-defaults/99-relay-min <<'SH'
+          #!/bin/sh
+          /etc/init.d/dropbear enable 2>/dev/null
+          /etc/init.d/dropbear start  2>/dev/null
+          /etc/init.d/dnsmasq stop 2>/dev/null
+          /etc/init.d/dnsmasq disable 2>/dev/null
+          /etc/init.d/firewall stop 2>/dev/null
+          /etc/init.d/firewall disable 2>/dev/null
+          wifi reload 2>/dev/null
+          exit 0
+          SH
+          chmod +x files/etc/uci-defaults/99-relay-min
+
+          # helper: /usr/bin/upstream-set
+          cat > files/usr/bin/upstream-set <<'SH'
+          #!/bin/sh
+          # usage: upstream-set "<ssid>" "<pass>" [bssid]
+          SSID="$1"; KEY="$2"; BSSID="$3"
+          [ -z "$SSID" ] && { echo "usage: upstream-set \"<ssid>\" \"<pass>\" [bssid]"; exit 1; }
+          uci set wireless.sta.ssid="$SSID"
+          uci set wireless.sta.encryption='psk2'
+          uci set wireless.sta.key="$KEY"
+          if [ -n "$BSSID" ]; then uci set wireless.sta.bssid="$BSSID"; else uci -q delete wireless.sta.bssid; fi
+          uci commit wireless
+          wifi reload
+          echo "Upstream set to: $SSID ${BSSID:+(BSSID $BSSID)}"
+          SH
+          chmod +x files/usr/bin/upstream-set
+
+          # helper: /usr/bin/upstream-use (optional multi-profile switch)
+          cat > files/usr/bin/upstream-use <<'SH'
+          #!/bin/sh
+          # usage: upstream-use home|office|hotspot  (requires sections: sta_home/sta_office/...)
+          PROFILE="$1"; [ -z "$PROFILE" ] && { echo "usage: upstream-use <profile>"; exit 1; }
+          PROFILES="$(uci show wireless | sed -n "s/^wireless\.\\(sta_[^=]*\\)=wifi-iface.*/\\1/p")"
+          for p in $PROFILES; do uci -q set wireless.$p.disabled='1'; done
+          uci -q set wireless.sta_$PROFILE.disabled='0' || { echo "profile not found: sta_$PROFILE"; exit 2; }
+          uci commit wireless
+          wifi reload
+          echo "Switched upstream to: $PROFILE"
+          SH
+          chmod +x files/usr/bin/upstream-use
+
+      - name: Build (ImageBuilder)
+        working-directory: ${{ env.IB_DIR }}
+        run: |
+          set -eux
+          PACKAGES="dropbear relayd wpad-mini \
+          -ppp -pppoe -ppp-mod-pppoe \
+          -luci -uhttpd \
+          -odhcpd-ipv6only -odhcp6c -ip6tables -kmod-ip6tables -kmod-ipv6 -ipv6helper \
+          -dnsmasq -firewall -iptables -kmod-ipt-nat -kmod-nf-nat -kmod-nf-conntrack \
+          -opkg -wget"
+          make image PROFILE=${PROFILE} PACKAGES="$PACKAGES" FILES=../files/
+
+      - name: Collect artifacts
+        working-directory: ${{ env.IB_DIR }}
+        run: |
+          OUTDIR="bin/targets/${TARGET}/${SUBTARGET}"
+          ls -lh ${OUTDIR}
+          mkdir -p ../artifacts
+          cp ${OUTDIR}/*wr802n*bin ../artifacts/ || true
+          (cd ../artifacts && sha256sum *bin > SHA256SUMS.txt)
+          ls -lh ../artifacts
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wr802n-v1-bridge-${{ env.OWRT_VER }}
+          path: artifacts
