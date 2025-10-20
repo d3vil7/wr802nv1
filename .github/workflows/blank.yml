@@ -8,12 +8,13 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04   # ← 固定版本，避免 24.04 的依赖坑
+    runs-on: ubuntu-20.04   # 固定到 20.04，便于安装 python2
     env:
       OWRT_VER: "18.06.9"
       TARGET: "ar71xx"
       SUBTARGET: "tiny"
       PROFILE: "tl-wr802n-v1"
+      # 内置管理/占位参数（可按需改）
       MGMT_AP_SSID: "Relay-AP"
       MGMT_AP_KEY: "Relay-AP-Password"
       UPSTREAM_SSID: "CHANGE_ME_UPSTREAM"
@@ -23,16 +24,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare host deps for old ImageBuilder
+      - name: Install legacy deps (gcc/g++/python2 等)
         run: |
+          set -eux
           sudo apt-get update
-          # 这些是旧版 IB 常见必需项；多给一点以兼容不同内核/toolchain
           sudo apt-get install -y \
-            build-essential \
+            build-essential gcc g++ \
+            python2 python2-minimal \
             libncurses5 libncurses5-dev libtinfo5 \
             zlib1g-dev gawk gettext libssl-dev xsltproc \
-            unzip file rsync wget curl ca-certificates \
-            python3 time
+            unzip file rsync wget curl ca-certificates python3 time
+          # 让 "python" 指向 python2（18.06 的脚本只认 python=2.x）
+          if [ -x /usr/bin/python2 ] && [ ! -e /usr/bin/python ]; then
+            sudo ln -s /usr/bin/python2 /usr/bin/python
+          fi
+          command -v gcc && gcc --version | head -1
+          command -v g++ && g++ --version | head -1
+          command -v python && python --version 2>&1
 
       - name: Download ImageBuilder
         run: |
@@ -44,11 +52,12 @@ jobs:
           tar xf "${IB_TAR}"
           echo "IB_DIR=$(basename "${IB_TAR}" .tar.xz)" >> $GITHUB_ENV
 
-      - name: Create minimal FILES (pure bridge + SSH)
+      - name: Create FILES tree (pure bridge + SSH)
         run: |
           set -eux
           mkdir -p files/etc/config files/etc/uci-defaults files/usr/bin
 
+          # /etc/config/wireless
           cat > files/etc/config/wireless <<'SH'
           config wifi-device 'radio0'
                   option type 'mac80211'
@@ -56,6 +65,7 @@ jobs:
                   option path 'platform/ar933x_wmac'
                   option channel 'auto'
 
+          # STA: 上游，占位，进机后用 upstream-set 修改
           config wifi-iface 'sta'
                   option device 'radio0'
                   option mode 'sta'
@@ -64,6 +74,7 @@ jobs:
                   option encryption 'psk2'
                   option key '__UP_KEY__'
 
+          # AP: 管理/下游热点
           config wifi-iface 'ap'
                   option device 'radio0'
                   option mode 'ap'
@@ -77,6 +88,7 @@ jobs:
           sed -i "s/__AP_SSID__/${MGMT_AP_SSID}/" files/etc/config/wireless
           sed -i "s/__AP_KEY__/${MGMT_AP_KEY}/" files/etc/config/wireless
 
+          # /etc/config/network（纯桥：LAN 本地管理网段 + WWAN DHCP + relayd 伪桥）
           cat > files/etc/config/network <<'SH'
           config interface 'lan'
                   option type 'bridge'
@@ -94,6 +106,7 @@ jobs:
                   option ipaddr '192.168.1.50'
           SH
 
+          # 首启：开启 dropbear；停用 dnsmasq/firewall；reload wifi
           cat > files/etc/uci-defaults/99-relay-min <<'SH'
           #!/bin/sh
           /etc/init.d/dropbear enable 2>/dev/null
@@ -107,8 +120,10 @@ jobs:
           SH
           chmod +x files/etc/uci-defaults/99-relay-min
 
+          # /usr/bin/upstream-set：一条命令改上游
           cat > files/usr/bin/upstream-set <<'SH'
           #!/bin/sh
+          # usage: upstream-set "<ssid>" "<pass>" [bssid]
           SSID="$1"; KEY="$2"; BSSID="$3"
           [ -z "$SSID" ] && { echo "usage: upstream-set \"<ssid>\" \"<pass>\" [bssid]"; exit 1; }
           uci set wireless.sta.ssid="$SSID"
@@ -121,7 +136,7 @@ jobs:
           SH
           chmod +x files/usr/bin/upstream-set
 
-      - name: Build (ImageBuilder with verbose log)
+      - name: Build (ImageBuilder, verbose)
         working-directory: ${{ env.IB_DIR }}
         run: |
           set -eux
@@ -131,19 +146,19 @@ jobs:
           -odhcpd-ipv6only -odhcp6c -ip6tables -kmod-ip6tables -kmod-ipv6 -ipv6helper \
           -dnsmasq -firewall -iptables -kmod-ipt-nat -kmod-nf-nat -kmod-nf-conntrack \
           -opkg -wget"
-          # V=s 打开详细日志；并把日志输出到文件以便失败时上传
           make V=s image PROFILE=${PROFILE} PACKAGES="$PACKAGES" FILES=../files/ | tee ../build.log
 
       - name: Collect artifacts
         if: always()
         working-directory: ${{ env.IB_DIR }}
         run: |
+          set -eux
           OUTDIR="bin/targets/${TARGET}/${SUBTARGET}"
           mkdir -p ../artifacts
           if [ -d "${OUTDIR}" ]; then cp ${OUTDIR}/*wr802n*bin ../artifacts/ || true; fi
-          (cd ../artifacts && ls -lh || true)
-          (cd ../artifacts && if ls *bin >/dev/null 2>&1; then sha256sum *bin > SHA256SUMS.txt; fi)
+          (cd ../artifacts && if ls *bin >/dev/null 2>&1; then sha256sum *bin > SHA256SUMS.txt; fi || true)
           cp ../build.log ../artifacts/ || true
+          ls -lah ../artifacts
 
       - name: Upload artifacts
         if: always()
