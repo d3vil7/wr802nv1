@@ -8,45 +8,55 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04   # 方案B固定22.04，手动安装python2（deadsnakes）
+    runs-on: ubuntu-22.04
     env:
       OWRT_VER: "18.06.9"
       TARGET: "ar71xx"
       SUBTARGET: "tiny"
       PROFILE: "tl-wr802n-v1"
-      # 内置占位：管理AP与上游（进机后用 upstream-set 改）
       MGMT_AP_SSID: "Relay-AP"
       MGMT_AP_KEY: "Relay-AP-Password"
       UPSTREAM_SSID: "CHANGE_ME_UPSTREAM"
       UPSTREAM_KEY: "CHANGE_ME_PASS"
+      LANG: "C"         # 防止 gcc --version 输出本地化
+      LC_ALL: "C"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install legacy deps (gcc/g++/python2 via deadsnakes)
+      - name: Install legacy deps (gcc-10/g++-10 + python2 via deadsnakes)
         run: |
           set -eux
           sudo apt-get update
-          # add-apt-repository 需要 software-properties-common
           sudo apt-get install -y software-properties-common ca-certificates curl
-          # 加 deadsnakes PPA 装 python2
+          # Python2（deadsnakes）
           sudo add-apt-repository -y ppa:deadsnakes/ppa
           sudo apt-get update
-          # 安装编译依赖 + python2
+          sudo apt-get install -y python2 python2-minimal
+
+          # 编译与老依赖
           sudo apt-get install -y \
-            build-essential gcc g++ \
-            python2 python2-minimal \
+            build-essential \
+            gcc-10 g++-10 \
             libncurses5 libncurses5-dev libtinfo5 \
             zlib1g-dev gawk gettext libssl-dev xsltproc \
             unzip file rsync wget time
-          # 让 "python" 指向 python2（18.06.x 脚本只认 python=2.x）
+
+          # 让 python 指向 python2（18.06 的脚本只认 python=2.x）
           if [ -x /usr/bin/python2 ] && [ ! -e /usr/bin/python ]; then
             sudo ln -s /usr/bin/python2 /usr/bin/python
           fi
-          command -v gcc && gcc --version | head -1
-          command -v g++ && g++ --version | head -1
-          command -v python && python --version 2>&1
+
+          # 把系统默认 gcc/g++ 显式切到 10 版本，避免某些脚本误判
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-10 100
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-10 100
+
+          echo "Diagnostics:"
+          which gcc; gcc --version | head -1
+          which g++; g++ --version | head -1
+          which python; python --version 2>&1
+          echo "PATH=$PATH"
 
       - name: Download ImageBuilder
         run: |
@@ -71,7 +81,6 @@ jobs:
                   option path 'platform/ar933x_wmac'
                   option channel 'auto'
 
-          # STA: 上游，占位；进机后用 upstream-set 修改
           config wifi-iface 'sta'
                   option device 'radio0'
                   option mode 'sta'
@@ -80,7 +89,6 @@ jobs:
                   option encryption 'psk2'
                   option key '__UP_KEY__'
 
-          # AP: 管理/下游热点
           config wifi-iface 'ap'
                   option device 'radio0'
                   option mode 'ap'
@@ -94,7 +102,7 @@ jobs:
           sed -i "s/__AP_SSID__/${MGMT_AP_SSID}/" files/etc/config/wireless
           sed -i "s/__AP_KEY__/${MGMT_AP_KEY}/" files/etc/config/wireless
 
-          # /etc/config/network（纯桥：LAN本地管理 + WWAN DHCP + relayd 伪桥）
+          # /etc/config/network（纯桥）
           cat > files/etc/config/network <<'SH'
           config interface 'lan'
                   option type 'bridge'
@@ -126,7 +134,7 @@ jobs:
           SH
           chmod +x files/etc/uci-defaults/99-relay-min
 
-          # /usr/bin/upstream-set：一条命令改上游
+          # /usr/bin/upstream-set
           cat > files/usr/bin/upstream-set <<'SH'
           #!/bin/sh
           # usage: upstream-set "<ssid>" "<pass>" [bssid]
@@ -142,8 +150,11 @@ jobs:
           SH
           chmod +x files/usr/bin/upstream-set
 
-      - name: Build (ImageBuilder, verbose)
+      - name: Build (ImageBuilder, verbose + prereq workaround)
         working-directory: ${{ env.IB_DIR }}
+        env:
+          CC: gcc
+          CXX: g++
         run: |
           set -eux
           PACKAGES="dropbear relayd wpad-mini \
@@ -152,7 +163,14 @@ jobs:
           -odhcpd-ipv6only -odhcp6c -ip6tables -kmod-ip6tables -kmod-ipv6 -ipv6helper \
           -dnsmasq -firewall -iptables -kmod-ipt-nat -kmod-nf-nat -kmod-nf-conntrack \
           -opkg -wget"
-          make V=s image PROFILE=${PROFILE} PACKAGES="$PACKAGES" FILES=../files/ | tee ../build.log
+
+          # 先打印 IB 所见的 gcc/g++
+          which gcc; gcc --version | head -1
+          which g++; g++ --version | head -1
+          which python; python --version 2>&1
+
+          # 加 FORCE=1 兜底，绕过古早 prereq 的误判
+          FORCE=1 make V=s image PROFILE=${PROFILE} PACKAGES="$PACKAGES" FILES=../files/ | tee ../build.log
 
       - name: Collect artifacts
         if: always()
