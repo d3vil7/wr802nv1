@@ -158,11 +158,14 @@ jobs:
         run: |
           set -eux
           PACKAGES="dropbear relayd wpad-mini \
-          -ppp -pppoe -ppp-mod-pppoe \
-          -luci -uhttpd \
-          -odhcpd-ipv6only -odhcp6c -ip6tables -kmod-ip6tables -kmod-ipv6 -ipv6helper \
-          -dnsmasq -firewall -iptables -kmod-ipt-nat -kmod-nf-nat -kmod-nf-conntrack \
-          -opkg -wget"
+           -ppp -pppoe -ppp-mod-pppoe \
+           -luci -uhttpd \
+           -odhcpd-ipv6only -odhcp6c -ip6tables -kmod-ip6tables -kmod-ipv6 -ipv6helper \
+           -dnsmasq -firewall -iptables -kmod-ipt-nat -kmod-nf-nat -kmod-nf-conntrack \
+           -opkg -wget \
+           -iwinfo -wireless-tools -libiwinfo -libiwinfo-lua -libjson-c -libubus-lua -liblua -lua \
+           -libustream-mbedtls -libustream-openssl -libustream-wolfssl -ca-bundle -ca-certificates"
+
 
           # 先打印 IB 所见的 gcc/g++
           which gcc; gcc --version | head -1
