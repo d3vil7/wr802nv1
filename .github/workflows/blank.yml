@@ -8,16 +8,14 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04   # ← 固定版本，避免 24.04 的依赖坑
     env:
       OWRT_VER: "18.06.9"
       TARGET: "ar71xx"
       SUBTARGET: "tiny"
       PROFILE: "tl-wr802n-v1"
-      # 下面两个只是内置管理 AP 的名字与密码（给你首登 SSH 用）
       MGMT_AP_SSID: "Relay-AP"
       MGMT_AP_KEY: "Relay-AP-Password"
-      # 首启占位的上游（进路由后用 upstream-set 改）
       UPSTREAM_SSID: "CHANGE_ME_UPSTREAM"
       UPSTREAM_KEY: "CHANGE_ME_PASS"
 
@@ -25,27 +23,32 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare host tools
+      - name: Prepare host deps for old ImageBuilder
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential wget xz-utils file rsync
+          # 这些是旧版 IB 常见必需项；多给一点以兼容不同内核/toolchain
+          sudo apt-get install -y \
+            build-essential \
+            libncurses5 libncurses5-dev libtinfo5 \
+            zlib1g-dev gawk gettext libssl-dev xsltproc \
+            unzip file rsync wget curl ca-certificates \
+            python3 time
 
       - name: Download ImageBuilder
         run: |
+          set -eux
           IB_TAR="openwrt-imagebuilder-${OWRT_VER}-${TARGET}-${SUBTARGET}.Linux-x86_64.tar.xz"
           IB_URL="https://downloads.openwrt.org/releases/${OWRT_VER}/targets/${TARGET}/${SUBTARGET}/${IB_TAR}"
-          wget -q "${IB_URL}"
+          echo "Fetching: ${IB_URL}"
+          curl -fL "${IB_URL}" -o "${IB_TAR}"
           tar xf "${IB_TAR}"
           echo "IB_DIR=$(basename "${IB_TAR}" .tar.xz)" >> $GITHUB_ENV
 
-      - name: Create FILES tree (minimal bridge config)
+      - name: Create minimal FILES (pure bridge + SSH)
         run: |
           set -eux
-          mkdir -p files/etc/config
-          mkdir -p files/etc/uci-defaults
-          mkdir -p files/usr/bin
+          mkdir -p files/etc/config files/etc/uci-defaults files/usr/bin
 
-          # /etc/config/wireless
           cat > files/etc/config/wireless <<'SH'
           config wifi-device 'radio0'
                   option type 'mac80211'
@@ -53,7 +56,6 @@ jobs:
                   option path 'platform/ar933x_wmac'
                   option channel 'auto'
 
-          # STA: connect to upstream (placeholder, change later via SSH)
           config wifi-iface 'sta'
                   option device 'radio0'
                   option mode 'sta'
@@ -62,7 +64,6 @@ jobs:
                   option encryption 'psk2'
                   option key '__UP_KEY__'
 
-          # AP: management / downstream
           config wifi-iface 'ap'
                   option device 'radio0'
                   option mode 'ap'
@@ -76,7 +77,6 @@ jobs:
           sed -i "s/__AP_SSID__/${MGMT_AP_SSID}/" files/etc/config/wireless
           sed -i "s/__AP_KEY__/${MGMT_AP_KEY}/" files/etc/config/wireless
 
-          # /etc/config/network (pure relay bridge)
           cat > files/etc/config/network <<'SH'
           config interface 'lan'
                   option type 'bridge'
@@ -94,7 +94,6 @@ jobs:
                   option ipaddr '192.168.1.50'
           SH
 
-          # uci-defaults: enable SSH; disable DHCP/firewall; reload wifi
           cat > files/etc/uci-defaults/99-relay-min <<'SH'
           #!/bin/sh
           /etc/init.d/dropbear enable 2>/dev/null
@@ -108,10 +107,8 @@ jobs:
           SH
           chmod +x files/etc/uci-defaults/99-relay-min
 
-          # helper: /usr/bin/upstream-set
           cat > files/usr/bin/upstream-set <<'SH'
           #!/bin/sh
-          # usage: upstream-set "<ssid>" "<pass>" [bssid]
           SSID="$1"; KEY="$2"; BSSID="$3"
           [ -z "$SSID" ] && { echo "usage: upstream-set \"<ssid>\" \"<pass>\" [bssid]"; exit 1; }
           uci set wireless.sta.ssid="$SSID"
@@ -124,21 +121,7 @@ jobs:
           SH
           chmod +x files/usr/bin/upstream-set
 
-          # helper: /usr/bin/upstream-use (optional multi-profile switch)
-          cat > files/usr/bin/upstream-use <<'SH'
-          #!/bin/sh
-          # usage: upstream-use home|office|hotspot  (requires sections: sta_home/sta_office/...)
-          PROFILE="$1"; [ -z "$PROFILE" ] && { echo "usage: upstream-use <profile>"; exit 1; }
-          PROFILES="$(uci show wireless | sed -n "s/^wireless\.\\(sta_[^=]*\\)=wifi-iface.*/\\1/p")"
-          for p in $PROFILES; do uci -q set wireless.$p.disabled='1'; done
-          uci -q set wireless.sta_$PROFILE.disabled='0' || { echo "profile not found: sta_$PROFILE"; exit 2; }
-          uci commit wireless
-          wifi reload
-          echo "Switched upstream to: $PROFILE"
-          SH
-          chmod +x files/usr/bin/upstream-use
-
-      - name: Build (ImageBuilder)
+      - name: Build (ImageBuilder with verbose log)
         working-directory: ${{ env.IB_DIR }}
         run: |
           set -eux
@@ -148,19 +131,22 @@ jobs:
           -odhcpd-ipv6only -odhcp6c -ip6tables -kmod-ip6tables -kmod-ipv6 -ipv6helper \
           -dnsmasq -firewall -iptables -kmod-ipt-nat -kmod-nf-nat -kmod-nf-conntrack \
           -opkg -wget"
-          make image PROFILE=${PROFILE} PACKAGES="$PACKAGES" FILES=../files/
+          # V=s 打开详细日志；并把日志输出到文件以便失败时上传
+          make V=s image PROFILE=${PROFILE} PACKAGES="$PACKAGES" FILES=../files/ | tee ../build.log
 
       - name: Collect artifacts
+        if: always()
         working-directory: ${{ env.IB_DIR }}
         run: |
           OUTDIR="bin/targets/${TARGET}/${SUBTARGET}"
-          ls -lh ${OUTDIR}
           mkdir -p ../artifacts
-          cp ${OUTDIR}/*wr802n*bin ../artifacts/ || true
-          (cd ../artifacts && sha256sum *bin > SHA256SUMS.txt)
-          ls -lh ../artifacts
+          if [ -d "${OUTDIR}" ]; then cp ${OUTDIR}/*wr802n*bin ../artifacts/ || true; fi
+          (cd ../artifacts && ls -lh || true)
+          (cd ../artifacts && if ls *bin >/dev/null 2>&1; then sha256sum *bin > SHA256SUMS.txt; fi)
+          cp ../build.log ../artifacts/ || true
 
       - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: wr802n-v1-bridge-${{ env.OWRT_VER }}
